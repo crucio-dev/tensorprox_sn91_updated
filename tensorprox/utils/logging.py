@@ -1,0 +1,178 @@
+import json
+import numpy as np
+import os
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
+from typing import Literal, Any, Dict
+
+import wandb
+from loguru import logger
+from pydantic import BaseModel, ConfigDict
+from wandb.wandb_run import Run
+
+import tensorprox
+from tensorprox.base.dendrite import DendriteResponseEvent
+from tensorprox.settings import settings
+
+WANDB: Run
+
+
+def should_reinit_wandb():
+    """Checks if 24 hours have passed since the last wandb initialization."""
+    # Get the start time from the wandb config
+    wandb_start_time = wandb.run.config.get("wandb_start_time", None)
+
+    if wandb_start_time:
+        # Convert the stored time (string) back to a datetime object
+        wandb_start_time = datetime.strptime(wandb_start_time, "%Y-%m-%d %H:%M:%S")
+        current_time = datetime.now()
+        elapsed_time = current_time - wandb_start_time
+        # Check if more than 24 hours have passed
+        if elapsed_time > timedelta(hours = settings.MAX_WANDB_DURATION):
+            return True
+    return False
+
+
+def init_wandb(reinit=False, neuron: Literal["validator", "miner"] = "validator", custom_tags: list = []):
+    """Starts a new wandb run."""
+    global WANDB
+    tags = [
+        f"Wallet: {settings.WALLET.hotkey.ss58_address}",
+        f"Version: {tensorprox.__version__}",
+        f"Netuid: {settings.NETUID}",
+    ]
+
+
+    if settings.NEURON_DISABLE_SET_WEIGHTS:
+        tags.append("disable_set_weights")
+        tags += [
+            f"Neuron UID: {settings.METAGRAPH.hotkeys.index(settings.WALLET.hotkey.ss58_address)}",
+            f"Time: {datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}",
+        ]
+
+    tags += custom_tags
+
+    wandb_config = {
+        "HOTKEY_SS58": settings.WALLET.hotkey.ss58_address,
+        "NETUID": settings.NETUID,
+        "wandb_start_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    
+
+    wandb.login(anonymous="allow", key=settings.WANDB_API_KEY, verify=True)
+    logger.info(f"Logging in to wandb on entity: {settings.WANDB_ENTITY} and project: {settings.WANDB_PROJECT_NAME}")
+    WANDB = wandb.init(
+        reinit=reinit,
+        project=settings.WANDB_PROJECT_NAME,
+        entity=settings.WANDB_ENTITY,
+        mode="offline" if settings.WANDB_OFFLINE else "online",
+        dir=settings.SAVE_PATH,
+        tags=tags,
+        notes=settings.WANDB_NOTES,
+        config=wandb_config,
+    )
+    signature = settings.WALLET.hotkey.sign(WANDB.id.encode()).hex()
+    wandb_config["SIGNATURE"] = signature
+    WANDB.config.update(wandb_config, allow_val_change=True)
+    logger.success(f"Started a new wandb run <blue> {WANDB.name} </blue>")
+
+
+def reinit_wandb():
+    """Reinitializes wandb, rolling over the run."""
+    global WANDB
+    WANDB.finish()
+    init_wandb(reinit=True)
+
+
+class BaseEvent(BaseModel):
+    forward_time: float | None = None
+
+class WeightSetEvent(BaseEvent):
+    weight_set_event: list[float]
+
+class ErrorLoggingEvent(BaseEvent):
+    error: str
+    forward_time: float | None = None
+
+
+class RewardLoggingEvent(BaseEvent):
+    block: int
+    step: int
+    uids: list[int]
+    rewards: list[float]
+    bdr: list[float]
+    ama: list[float]
+    sps: list[float]
+    rtc: list[float]
+    vps: list[float]
+    rtt_value: list[float]
+    lf: list[float]
+    ttl_attacks_sent: list[int]
+    ttl_packets_sent: list[int]
+    best_miner_score: float
+    best_bandwidth: float
+    best_capacity: float
+    best_purity: float
+    best_bdr: float
+    global_bandwidth: float
+    global_capacity: float
+    global_purity: float
+    global_bdr: float
+    response_event: DendriteResponseEvent
+
+    
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def __str__(self):
+        rewards = self.rewards
+        uids = self.uids
+        
+        return f"""RewardLoggingEvent:
+            Rewards:
+                Uids: {uids}
+                Rewards: {rewards}
+                Min: {np.min(rewards) if len(rewards) > 0 else None}
+                Max: {np.max(rewards) if len(rewards) > 0 else None}
+                Average: {np.mean(rewards) if len(rewards) > 0 else None}
+        """
+
+
+class MinerLoggingEvent(BaseEvent):
+    epoch_time: float
+    validator_uid: int
+    validator_ip: str
+    validator_coldkey: str
+    validator_hotkey: str
+    validator_stake: float
+    validator_trust: float
+    validator_incentive: float
+    validator_consensus: float
+    validator_dividends: float
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
+def log_event(event: BaseEvent):
+    if not settings.LOGGING_DONT_SAVE_EVENTS:
+        logger.info(f"{event}")
+
+    if settings.WANDB_ON:
+        # if should_reinit_wandb():
+        #     reinit_wandb()
+        unpacked_event = unpack_events(event)
+        unpacked_event = convert_arrays_to_lists(unpacked_event)
+        wandb.log(unpacked_event)
+
+
+def unpack_events(event: BaseEvent) -> dict[str, Any]:
+    """reward_events and penalty_events are unpacked into a list of dictionaries."""
+    event_dict = event.model_dump()
+    for key in list(event_dict.keys()):
+        if key == "response_event":
+            nested_dict = event_dict.pop(key)
+            if isinstance(nested_dict, dict):
+                event_dict.update(nested_dict)
+    return event_dict
+
+
+def convert_arrays_to_lists(data: dict) -> dict:
+    return {key: value.tolist() if hasattr(value, "tolist") else value for key, value in data.items()}
